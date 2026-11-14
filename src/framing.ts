@@ -46,32 +46,3 @@ export class Decoder {
     return out;
   }
 }
-
-/**
- * Bun socket writes can be partial: write() returns how many bytes went out
- * and drops the rest. This queues the remainder and flushes it on drain.
- */
-export class SocketWriter {
-  private queue: Uint8Array[] = [];
-  constructor(private readonly sock: { write(b: Uint8Array): number }) {}
-  write(bytes: Uint8Array) {
-    if (this.queue.length) {
-      this.queue.push(bytes);
-      return;
-    }
-    const n = this.sock.write(bytes);
-    if (n < bytes.length) this.queue.push(bytes.subarray(Math.max(n, 0)));
-  }
-  /** Call from the socket's drain handler. */
-  drain() {
-    while (this.queue.length) {
-      const head = this.queue[0];
-      const n = this.sock.write(head);
-      if (n < head.length) {
-        this.queue[0] = head.subarray(Math.max(n, 0));
-        return;
-      }
-      this.queue.shift();
-    }
-  }
-}

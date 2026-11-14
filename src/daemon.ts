@@ -3,21 +3,26 @@
 // Sessions (shims) connect over a Unix socket and speak LSP. Each document is
 // routed to the server for the nearest node_modules/typescript above it:
 // `tsc --lsp` for TypeScript 7 and later, typescript-language-server pointed at
-// that TypeScript for older ones. Servers are keyed by the real path of the
-// install, so worktrees that share bun's package cache share one server, and a
-// repo with mixed TypeScript versions gets the right server per package.
+// that TypeScript for older ones. Servers are keyed by repo and TypeScript
+// version: every worktree of one repo shares a server, whichever package
+// manager installed it, a repo with mixed versions gets one server per version,
+// and two repos never share one. Each worktree is its own workspace folder in
+// the server, so each session sees only its own files.
 //
 // The daemon rewrites request IDs so each session only sees its own replies,
 // counts opens per document so one session closing a file doesn't close it for
 // another, and answers the servers' own requests (configuration, progress).
 
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
+import { createConnection, createServer, type Socket } from "node:net";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Socket } from "bun";
-import { Decoder, SocketWriter, encode, type Message } from "./framing.ts";
-import { IDLE_MS, LOG, SOCKET, debug, uriKey } from "./paths.ts";
+import { Decoder, encode, type Message } from "./framing.ts";
+import { IDLE_MS, LOG, SOCKET, VERSION, debug, isMain, uriKey } from "./paths.ts";
+
+type Timer = ReturnType<typeof setTimeout>;
 
 const log = (...a: unknown[]) => {
   const line = `${new Date().toISOString()} ${a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")}\n`;
@@ -28,7 +33,7 @@ const log = (...a: unknown[]) => {
 
 // ---- which server serves a folder ------------------------------------------
 
-export type Spec = { key: string; kind: "tsc" | "tsls"; version: string; cmd: string[]; tsDir: string };
+export type Spec = { key: string; kind: "tsc" | "tsls"; version: string; cmd: string[]; tsDir: string; repo: string };
 
 const specCache = new Map<string, Spec | null>();
 
@@ -40,6 +45,18 @@ function findTsls(): string | null {
   return null;
 }
 
+/**
+ * The repo a folder belongs to: git's common directory, which is the same for
+ * every worktree of one repo. A folder outside git is its own repo.
+ */
+export function repoOf(dir: string): string {
+  try {
+    const out = execFileSync("git", ["rev-parse", "--git-common-dir"], { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (out) return realpathSync(resolve(dir, out));
+  } catch {}
+  return realpathSync(dir);
+}
+
 /** The server for files in `dir`: the nearest node_modules/typescript above it. */
 export function specFor(dir: string): Spec | null {
   const cached = specCache.get(dir);
@@ -49,12 +66,14 @@ export function specFor(dir: string): Spec | null {
   if (existsSync(pkg)) {
     const tsDir = realpathSync(dirname(pkg));
     const version: string = JSON.parse(readFileSync(pkg, "utf8")).version ?? "0";
+    const repo = repoOf(dir);
+    // The first worktree to ask supplies the binary; the others have the same version.
     if (Number(version.split(".")[0]) >= 7) {
       const tsc = join(tsDir, "bin", "tsc");
-      spec = { key: `tsc ${tsc}`, kind: "tsc", version, cmd: [tsc, "--lsp", "--stdio"], tsDir };
+      spec = { key: `tsc ${version} ${repo}`, kind: "tsc", version, cmd: [tsc, "--lsp", "--stdio"], tsDir, repo };
     } else {
       const tsls = findTsls();
-      if (tsls) spec = { key: `tsls ${tsDir}`, kind: "tsls", version, cmd: [tsls, "--stdio"], tsDir };
+      if (tsls) spec = { key: `tsls ${version} ${repo}`, kind: "tsls", version, cmd: [tsls, "--stdio"], tsDir, repo };
     }
   } else if (dirname(dir) !== dir) {
     spec = specFor(dirname(dir));
@@ -73,13 +92,11 @@ const uriDir = (uri: string) => {
 
 // ---- sessions ----------------------------------------------------------------
 
-type ClientData = { client?: Client };
-
 class Client {
   static seq = 0;
   readonly n = ++Client.seq;
   readonly decoder = new Decoder();
-  readonly out: SocketWriter;
+  readonly sock: Socket;
   cwd?: string;
   root?: string;
   initParams?: any;
@@ -87,21 +104,22 @@ class Client {
   readonly servers = new Set<Server>();
   readonly docServer = new Map<string, Server>();
   closed = false;
-  constructor(readonly sock: Socket<ClientData>) {
-    this.out = new SocketWriter(sock);
+  constructor(sock: Socket) {
+    this.sock = sock;
   }
   send(msg: Message) {
     if (this.closed) return;
     if (msg.method === "textDocument/publishDiagnostics")
       debug("daemon", "session", this.n, "pushed by server", (msg.params as any).uri, (msg.params as any).diagnostics?.length);
-    this.out.write(encode(msg));
+    this.sock.write(encode(msg));
   }
 }
 
 type Pending = { client: Client; id: number | string } | { resolve: (m: Message) => void };
 
 class Server {
-  readonly proc: ReturnType<typeof Bun.spawn>;
+  readonly spec: Spec;
+  readonly proc: ChildProcess;
   readonly decoder = new Decoder();
   readonly clients = new Set<Client>();
   readonly pending = new Map<number, Pending>();
@@ -113,20 +131,19 @@ class Server {
   idleTimer?: Timer;
   dead = false;
 
-  constructor(
-    readonly spec: Spec,
-    cwd: string,
-    initParams: any,
-  ) {
-    this.proc = Bun.spawn(spec.cmd, {
-      cwd,
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "ignore",
-      onExit: (_p, code) => this.onExit(code),
+  constructor(spec: Spec, cwd: string, initParams: any) {
+    this.spec = spec;
+    this.proc = spawn(spec.cmd[0], spec.cmd.slice(1), { cwd, stdio: ["pipe", "pipe", "ignore"] });
+    this.proc.on("exit", (code) => this.onExit(code));
+    this.proc.on("error", (e) => {
+      log("server error", spec.key, String(e));
+      this.onExit(null);
     });
-    log("server start", spec.key, spec.version, "pid", this.proc.pid);
-    this.pump();
+    this.proc.stdin!.on("error", () => {}); // a dead server's pipe: onExit cleans up
+    this.proc.stdout!.on("data", (chunk: Buffer) => {
+      for (const m of this.decoder.push(chunk)) this.onMessage(m);
+    });
+    log("server start", spec.key, "pid", this.proc.pid);
     const params = structuredClone(initParams ?? {});
     params.processId = null; // the server must outlive the session that started it
     params.capabilities ??= {};
@@ -135,6 +152,10 @@ class Server {
     params.capabilities.workspace ??= {};
     params.capabilities.workspace.configuration = true;
     params.capabilities.workspace.workspaceFolders = true;
+    // Without dynamic registration TypeScript 7 watches each project's files
+    // itself, node_modules included, so a package installed in one worktree is
+    // picked up there. Claude Code sends no file-change events of its own.
+    params.capabilities.workspace.didChangeWatchedFiles = { dynamicRegistration: false };
     if (spec.kind === "tsls") {
       params.initializationOptions ??= {};
       params.initializationOptions.tsserver = { ...params.initializationOptions.tsserver, path: join(spec.tsDir, "lib", "tsserver.js") };
@@ -154,13 +175,8 @@ class Server {
     });
   }
 
-  private async pump() {
-    const stdout = this.proc.stdout as ReadableStream<Uint8Array>;
-    for await (const chunk of stdout) for (const m of this.decoder.push(chunk)) this.onMessage(m);
-  }
-
   private raw(msg: unknown) {
-    if (!this.dead) (this.proc.stdin as import("bun").FileSink).write(encode(msg));
+    if (!this.dead) this.proc.stdin!.write(encode(msg));
   }
   write(msg: unknown) {
     if (this.queue) this.queue.push(msg);
@@ -267,8 +283,9 @@ class Server {
   }
 
   private onExit(code: number | null) {
+    if (this.dead) return;
     this.dead = true;
-    servers.delete(this.spec.key);
+    if (servers.get(this.spec.key) === this) servers.delete(this.spec.key);
     log("server exit", this.spec.key, "code", code);
     for (const [, p] of this.pending) {
       if ("resolve" in p) p.resolve({ jsonrpc: "2.0", error: { code: -32603, message: "server exited" } });
@@ -315,19 +332,24 @@ function checkDaemonIdle() {
 }
 
 function rssOf(pid: number): number {
-  const out = Bun.spawnSync(["ps", "-o", "rss=", "-p", String(pid)]).stdout.toString().trim();
-  return Math.round(Number(out || 0) / 1024);
+  try {
+    const out = execFileSync("ps", ["-o", "rss=", "-p", String(pid)], { encoding: "utf8" }).trim();
+    return Math.round(Number(out || 0) / 1024);
+  } catch {
+    return 0;
+  }
 }
 
 function status() {
   return {
-    daemon: { pid: process.pid, rssMB: rssOf(process.pid) },
+    daemon: { pid: process.pid, version: VERSION, runtime: process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.versions.node}`, rssMB: rssOf(process.pid) },
     servers: [...servers.values()].map((s) => ({
       kind: s.spec.kind,
       typescript: s.spec.version,
+      repo: s.spec.repo,
       typescriptDir: s.spec.tsDir,
       pid: s.proc.pid,
-      rssMB: rssOf(s.proc.pid),
+      rssMB: s.proc.pid ? rssOf(s.proc.pid) : 0,
       sessions: [...s.clients].map((c) => c.root ?? c.cwd),
       openDocs: [...s.docs.values()].map((d) => d.uri),
     })),
@@ -397,52 +419,45 @@ function cleanup() {
   } catch {}
 }
 
-async function alreadyRunning(): Promise<boolean> {
-  if (!existsSync(SOCKET)) return false;
-  try {
-    const s = await Bun.connect({ unix: SOCKET, socket: { data() {} } });
-    s.end();
-    return true;
-  } catch {
-    return false;
-  }
+function alreadyRunning(): Promise<boolean> {
+  if (!existsSync(SOCKET)) return Promise.resolve(false);
+  return new Promise((done) => {
+    const s = createConnection(SOCKET);
+    s.on("connect", () => {
+      s.end();
+      done(true);
+    });
+    s.on("error", () => done(false));
+  });
 }
 
 export async function main() {
   mkdirSync(dirname(SOCKET), { recursive: true });
   if (await alreadyRunning()) process.exit(0);
   cleanup(); // stale socket from a daemon that died
-  Bun.listen<ClientData>({
-    unix: SOCKET,
-    socket: {
-      open(sock) {
-        const c = new Client(sock);
-        sock.data = { client: c };
-        clients.add(c);
-        clearTimeout(daemonIdle);
-      },
-      data(sock, chunk) {
-        const c = sock.data.client!;
-        for (const m of c.decoder.push(chunk)) onClientMessage(c, m).catch((e) => log("error", String(e)));
-      },
-      drain(sock) {
-        sock.data.client?.out.drain();
-      },
-      close(sock) {
-        const c = sock.data.client!;
-        if (c.closed) return;
-        c.closed = true;
-        clients.delete(c);
-        for (const s of c.servers) s.detach(c);
-        log("session", c.n, "closed", c.root);
-        checkDaemonIdle();
-      },
-      error(_sock, err) {
-        log("socket error", String(err));
-      },
-    },
+  const server = createServer((sock) => {
+    const c = new Client(sock);
+    clients.add(c);
+    clearTimeout(daemonIdle);
+    sock.on("data", (chunk: Buffer) => {
+      for (const m of c.decoder.push(chunk)) onClientMessage(c, m).catch((e) => log("error", String(e)));
+    });
+    sock.on("error", (err) => log("socket error", String(err)));
+    sock.on("close", () => {
+      if (c.closed) return;
+      c.closed = true;
+      clients.delete(c);
+      for (const s of c.servers) s.detach(c);
+      log("session", c.n, "closed", c.root);
+      checkDaemonIdle();
+    });
   });
-  log("daemon start pid", process.pid, "idle ms", IDLE_MS);
+  server.on("error", (err) => {
+    log("listen error", String(err));
+    process.exit(1);
+  });
+  server.listen(SOCKET);
+  log("daemon start pid", process.pid, "version", VERSION, "idle ms", IDLE_MS);
   for (const sig of ["SIGTERM", "SIGINT"] as const)
     process.on(sig, () => {
       for (const s of servers.values()) s.stop(sig);
@@ -452,4 +467,4 @@ export async function main() {
   checkDaemonIdle();
 }
 
-if (import.meta.main) main();
+if (isMain(import.meta.url)) main();

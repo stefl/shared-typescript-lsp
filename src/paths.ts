@@ -1,8 +1,20 @@
+import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** The plugin's version. Each version runs its own daemon, so an update never
+ * swaps the code under sessions already attached to the old one. */
+export const VERSION: string = (() => {
+  try {
+    return JSON.parse(readFileSync(join(import.meta.dirname, "..", ".claude-plugin", "plugin.json"), "utf8")).version;
+  } catch {
+    return "dev";
+  }
+})();
 
 export const HUB_DIR = process.env.SHARED_TS_LSP_DIR ?? join(homedir(), ".cache", "shared-typescript-lsp");
-export const SOCKET = join(HUB_DIR, "daemon.sock");
+export const SOCKET = join(HUB_DIR, `daemon-${VERSION}.sock`);
 export const LOG = join(HUB_DIR, "daemon.log");
 
 /** Close a server, and then the daemon, after this long with no sessions. */
@@ -25,4 +37,13 @@ export function debug(who: string, ...parts: unknown[]) {
   try {
     appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${who}[${process.pid}] ${line}\n`);
   } catch {}
+}
+
+/** True when this module is the script Node or Bun was started with. */
+export function isMain(url: string): boolean {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(url));
+  } catch {
+    return false;
+  }
 }

@@ -12,39 +12,39 @@
 
 import { spawn } from "node:child_process";
 import { openSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { Decoder, SocketWriter, encode, type Message } from "./framing.ts";
-import { HUB_DIR, LOG, SOCKET, debug } from "./paths.ts";
+import { createConnection, type Socket } from "node:net";
+import { extname, join } from "node:path";
+import { performance } from "node:perf_hooks";
+import { setTimeout as sleep } from "node:timers/promises";
+import { Decoder, encode, type Message } from "./framing.ts";
+import { HUB_DIR, LOG, SOCKET, debug, isMain } from "./paths.ts";
 
 const PULL_DEBOUNCE_MS = 150;
 
-async function connect(): Promise<import("bun").Socket<undefined> & { onMsg?: (m: Message) => void; onClose?: () => void; out: SocketWriter }> {
-  const decoder = new Decoder();
-  const sock: any = await Bun.connect({
-    unix: SOCKET,
-    socket: {
-      data(_s, chunk) {
+type Conn = Socket & { onMsg?: (m: Message) => void; onClose?: () => void };
+
+function connect(): Promise<Conn> {
+  return new Promise((done, fail) => {
+    const decoder = new Decoder();
+    const sock = createConnection(SOCKET) as Conn;
+    sock.once("error", fail);
+    sock.once("connect", () => {
+      sock.off("error", fail);
+      sock.on("data", (chunk: Buffer) => {
         for (const m of decoder.push(chunk)) sock.onMsg?.(m);
-      },
-      drain() {
-        sock.out?.drain();
-      },
-      close() {
-        sock.onClose?.();
-      },
-      error() {
-        sock.onClose?.();
-      },
-    },
+      });
+      sock.on("error", () => sock.onClose?.());
+      sock.on("close", () => sock.onClose?.());
+      done(sock);
+    });
   });
-  sock.out = new SocketWriter(sock);
-  return sock;
 }
 
 function startDaemon() {
   mkdirSync(HUB_DIR, { recursive: true });
   const out = openSync(LOG, "a");
-  const child = spawn(process.execPath, [join(import.meta.dir, "daemon.ts")], {
+  // The same runtime and flags this shim runs under: Node, or Bun if started with Bun.
+  const child = spawn(process.execPath, [...process.execArgv, join(import.meta.dirname, `daemon${extname(import.meta.filename)}`)], {
     detached: true,
     stdio: ["ignore", out, out],
     cwd: HUB_DIR,
@@ -58,7 +58,7 @@ async function connectOrStart() {
   } catch {}
   startDaemon();
   for (let i = 0; i < 500; i++) {
-    await Bun.sleep(10);
+    await sleep(10);
     try {
       return await connect();
     } catch {}
@@ -78,14 +78,14 @@ async function status() {
     console.log(JSON.stringify(m.result, null, 2));
     process.exit(0);
   };
-  sock.out.write(encode({ jsonrpc: "2.0", id: 1, method: "hub/status" }));
+  sock.write(encode({ jsonrpc: "2.0", id: 1, method: "hub/status" }));
 }
 
 async function serve() {
   debug("shim", "start, process age", `${Math.round(performance.now())}ms`);
   const sock = await connectOrStart();
   debug("shim", "connected", `${Math.round(performance.now())}ms`);
-  const toDaemon = (m: unknown) => sock.out.write(encode(m));
+  const toDaemon = (m: unknown) => sock.write(encode(m));
   const toClaude = (m: Message) => {
     if (m.method === "textDocument/publishDiagnostics") {
       const p = m.params as any;
@@ -99,7 +99,7 @@ async function serve() {
   const open = new Map<string, number>(); // uri -> session's version
   let pullSeq = 0;
   const pulls = new Map<string, { uri: string; retried: boolean; at: number }>();
-  let pullTimer: Timer | undefined;
+  let pullTimer: ReturnType<typeof setTimeout> | undefined;
   const dirty = new Set<string>();
 
   function pull(uri: string, retried = false) {
@@ -207,12 +207,12 @@ async function warm() {
       process.exit(0);
     }
   };
-  sock.out.write(encode({ jsonrpc: "2.0", method: "hub/hello", params: { cwd: process.cwd() } }));
-  sock.out.write(encode({ jsonrpc: "2.0", id: "warm", method: "initialize", params: { processId: null, rootUri: root, capabilities: {} } }));
+  sock.write(encode({ jsonrpc: "2.0", method: "hub/hello", params: { cwd: process.cwd() } }));
+  sock.write(encode({ jsonrpc: "2.0", id: "warm", method: "initialize", params: { processId: null, rootUri: root, capabilities: {} } }));
   setTimeout(() => process.exit(0), 30_000);
 }
 
-if (import.meta.main) {
+if (isMain(import.meta.url)) {
   if (process.argv[2] === "status") await status();
   else if (process.argv[2] === "warm") await warm();
   else await serve();

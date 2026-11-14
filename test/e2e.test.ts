@@ -2,6 +2,7 @@
 // Needs two checkouts of a TypeScript 7 repo with packages installed:
 //   SHARED_TS_LSP_E2E_A=<worktree> SHARED_TS_LSP_E2E_B=<worktree> bun test test/e2e.test.ts
 // The file and symbol default to blackhole's apps/mcp/src/card.ts and hostInsets.
+// SHARED_TS_LSP_RUNTIME=/path/to/node (or bun) picks the runtime the plugin runs on.
 import { afterAll, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";

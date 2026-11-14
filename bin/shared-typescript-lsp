@@ -17,23 +17,49 @@
 # Log lines go to stderr only: stdout is the LSP protocol channel.
 
 HUB="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-BUN="${BUN:-$HOME/.bun/bin/bun}"
-[ -x "$BUN" ] || BUN="$(command -v bun)"
-if [ -z "$BUN" ]; then
-  echo "shared-typescript-lsp: Bun not found; install it from https://bun.sh" >&2
+
+# Runtime: Node 20.11 or later, or Bun, which is used when Node is missing or older.
+# SHARED_TS_LSP_RUNTIME=/path/to/node-or-bun picks one.
+node_ok() {
+  local v
+  v=$("$1" -p 'process.versions.node' 2>/dev/null) || return 1
+  local major=${v%%.*} rest=${v#*.}
+  local minor=${rest%%.*}
+  [ "$major" -gt 20 ] 2>/dev/null && return 0
+  [ "$major" -eq 20 ] 2>/dev/null && [ "$minor" -ge 11 ] && return 0
+  return 1
+}
+RUN=()
+if [ -n "$SHARED_TS_LSP_RUNTIME" ]; then
+  RUN=("$SHARED_TS_LSP_RUNTIME")
+else
+  for n in "$(command -v node)" /opt/homebrew/bin/node /usr/local/bin/node "$HOME/.volta/bin/node"; do
+    if [ -n "$n" ] && [ -x "$n" ] && node_ok "$n"; then RUN=("$n"); break; fi
+  done
+  if [ ${#RUN[@]} -eq 0 ]; then
+    for b in "$(command -v bun)" "$HOME/.bun/bin/bun"; do
+      if [ -n "$b" ] && [ -x "$b" ]; then RUN=("$b"); break; fi
+    done
+  fi
+fi
+if [ ${#RUN[@]} -eq 0 ]; then
+  echo "shared-typescript-lsp: needs Node 20.11 or later (or Bun); found neither" >&2
   [ "$1" = warm ] && exit 0
   exit 1
 fi
+# TypeScript 7's tsc is a Node script (#!/usr/bin/env node): keep Node on the PATH.
+PATH="$(dirname "${RUN[0]}"):$PATH"
+export PATH
 
 case "$1" in
-  status) exec "$BUN" "$HUB/src/shim.ts" status ;;
+  status) exec "${RUN[@]}" "$HUB/dist/shim.js" status ;;
   warm)
     # SessionStart hook: start the shared server now, in the background, silently.
     [ -n "$SHARED_TS_LSP_OFF" ] && exit 0
-    (cd "${CLAUDE_PROJECT_DIR:-$PWD}" && nohup "$BUN" "$HUB/src/shim.ts" warm >/dev/null 2>&1 &)
+    (cd "${CLAUDE_PROJECT_DIR:-$PWD}" && nohup "${RUN[@]}" "$HUB/dist/shim.js" warm >/dev/null 2>&1 &)
     exit 0 ;;
   stop)
-    pid=$("$BUN" "$HUB/src/shim.ts" status 2>/dev/null | sed -n 's/.*"pid": \([0-9]*\).*/\1/p' | head -1)
+    pid=$("${RUN[@]}" "$HUB/dist/shim.js" status 2>/dev/null | sed -n 's/.*"pid": \([0-9]*\).*/\1/p' | head -1)
     [ -n "$pid" ] && kill "$pid" && echo "shared-typescript-lsp: stopped daemon $pid" || echo "shared-typescript-lsp: daemon not running"
     exit 0 ;;
 esac
@@ -49,7 +75,7 @@ if [ -f "$dir/node_modules/typescript/package.json" ]; then
   if [ -z "$SHARED_TS_LSP_OFF" ]; then
     # The daemon picks the server per file: a repo can mix TypeScript versions.
     echo "shared-typescript-lsp: TypeScript $version in $dir, using the shared server" >&2
-    exec "$BUN" "$HUB/src/shim.ts"
+    exec "${RUN[@]}" "$HUB/dist/shim.js"
   fi
   if [ "${major:-0}" -ge 7 ] 2>/dev/null && [ -x "$dir/node_modules/.bin/tsc" ]; then
     echo "shared-typescript-lsp: off, TypeScript $version in $dir, using its own tsc --lsp" >&2

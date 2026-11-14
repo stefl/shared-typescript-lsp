@@ -12,9 +12,10 @@
 //        shim.ts warm               (start the server for this folder ahead of use)
 
 import { spawn } from "node:child_process";
-import { openSync, mkdirSync } from "node:fs";
+import { mkdirSync, openSync, readdirSync, readFileSync,             } from "node:fs";
 import { createConnection,             } from "node:net";
-import { extname, join } from "node:path";
+import { dirname, extname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Decoder, encode,              } from "./framing.js";
@@ -45,7 +46,7 @@ function startDaemon() {
   mkdirSync(HUB_DIR, { recursive: true });
   const out = openSync(LOG, "a");
   // The same runtime and flags this shim runs under: Node, or Bun if started with Bun.
-  const child = spawn(process.execPath, [...process.execArgv, join(import.meta.dirname, `daemon${extname(import.meta.filename)}`)], {
+  const child = spawn(process.execPath, [...process.execArgv, join(dirname(fileURLToPath(import.meta.url)), `daemon${extname(fileURLToPath(import.meta.url))}`)], {
     detached: true,
     stdio: ["ignore", out, out],
     cwd: HUB_DIR,
@@ -192,20 +193,53 @@ async function serve() {
   });
 }
 
+/** A TypeScript source file under `dir`, for warm() to open. */
+function sampleFile(dir        , depth = 0)                {
+  let entries          ;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const e of entries)
+    if (e.isFile() && /\.(ts|tsx|mts|cts)$/.test(e.name) && !e.name.endsWith(".d.ts")) return join(dir, e.name);
+  if (depth >= 4) return null;
+  for (const e of entries) {
+    if (!e.isDirectory() || e.name.startsWith(".") || e.name === "node_modules" || e.name === "dist") continue;
+    const f = sampleFile(join(dir, e.name), depth + 1);
+    if (f) return f;
+  }
+  return null;
+}
+
 /**
  * Start the daemon and the server for this folder ahead of the first edit,
- * then leave. Claude Code starts its language server only when a session first
- * edits a file, and reads diagnostics as soon as the Edit returns, so a cold
- * start misses that edit's type errors. Run from a SessionStart hook.
+ * and have the server load the folder's project by opening one file and asking
+ * for its diagnostics. Claude Code starts its language server only when a
+ * session first edits a file, and reads diagnostics about 100 ms later, so a
+ * cold server or an unloaded project misses that edit's type errors. Run from
+ * a SessionStart hook.
  */
 async function warm() {
   const sock = await connectOrStart();
   const root = `file://${process.cwd()}`;
+  const file = sampleFile(process.cwd());
+  const uri = file ? `file://${file}` : null;
+  const done = () => {
+    debug("shim", "warm done", `${Math.round(performance.now())}ms`, uri ?? "no file");
+    sock.end();
+    process.exit(0);
+  };
   sock.onMsg = (m) => {
     if (m.id === "warm") {
-      debug("shim", "warm done", `${Math.round(performance.now())}ms`);
-      sock.end();
-      process.exit(0);
+      if (!uri) return done();
+      sock.write(encode({ jsonrpc: "2.0", method: "initialized", params: {} }));
+      const text = readFileSync(file , "utf8");
+      sock.write(encode({ jsonrpc: "2.0", method: "textDocument/didOpen", params: { textDocument: { uri, languageId: "typescript", version: 1, text } } }));
+      sock.write(encode({ jsonrpc: "2.0", id: "warm-pull", method: "textDocument/diagnostic", params: { textDocument: { uri } } }));
+    } else if (m.id === "warm-pull") {
+      sock.write(encode({ jsonrpc: "2.0", method: "textDocument/didClose", params: { textDocument: { uri } } }));
+      setTimeout(done, 20);
     }
   };
   sock.write(encode({ jsonrpc: "2.0", method: "hub/hello", params: { cwd: process.cwd() } }));

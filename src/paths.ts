@@ -1,20 +1,29 @@
+import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 /** The plugin's version. Each version runs its own daemon, so an update never
  * swaps the code under sessions already attached to the old one. */
 export const VERSION: string = (() => {
   try {
-    return JSON.parse(readFileSync(join(import.meta.dirname, "..", ".claude-plugin", "plugin.json"), "utf8")).version;
+    return JSON.parse(readFileSync(join(here, "..", ".claude-plugin", "plugin.json"), "utf8")).version;
   } catch {
     return "dev";
   }
 })();
 
 export const HUB_DIR = process.env.SHARED_TS_LSP_DIR ?? join(homedir(), ".cache", "shared-typescript-lsp");
-export const SOCKET = join(HUB_DIR, `daemon-${VERSION}.sock`);
+/** The daemon's socket. Unix socket paths are capped at about 104 bytes, so a
+ * long folder falls back to a short name in /tmp, unique to that folder. */
+export const SOCKET = (() => {
+  const p = join(HUB_DIR, `daemon-${VERSION}.sock`);
+  if (Buffer.byteLength(p) < 100) return p;
+  return join("/tmp", `shared-ts-lsp-${createHash("sha256").update(p).digest("hex").slice(0, 16)}.sock`);
+})();
 export const LOG = join(HUB_DIR, "daemon.log");
 
 /** Close a server, and then the daemon, after this long with no sessions. */

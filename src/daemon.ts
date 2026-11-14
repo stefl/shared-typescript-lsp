@@ -1,0 +1,455 @@
+// shared-typescript-lsp daemon: shared TypeScript language servers, many sessions.
+//
+// Sessions (shims) connect over a Unix socket and speak LSP. Each document is
+// routed to the server for the nearest node_modules/typescript above it:
+// `tsc --lsp` for TypeScript 7 and later, typescript-language-server pointed at
+// that TypeScript for older ones. Servers are keyed by the real path of the
+// install, so worktrees that share bun's package cache share one server, and a
+// repo with mixed TypeScript versions gets the right server per package.
+//
+// The daemon rewrites request IDs so each session only sees its own replies,
+// counts opens per document so one session closing a file doesn't close it for
+// another, and answers the servers' own requests (configuration, progress).
+
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { Socket } from "bun";
+import { Decoder, SocketWriter, encode, type Message } from "./framing.ts";
+import { IDLE_MS, LOG, SOCKET, debug, uriKey } from "./paths.ts";
+
+const log = (...a: unknown[]) => {
+  const line = `${new Date().toISOString()} ${a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")}\n`;
+  try {
+    appendFileSync(LOG, line);
+  } catch {}
+};
+
+// ---- which server serves a folder ------------------------------------------
+
+export type Spec = { key: string; kind: "tsc" | "tsls"; version: string; cmd: string[]; tsDir: string };
+
+const specCache = new Map<string, Spec | null>();
+
+function findTsls(): string | null {
+  for (const dir of (process.env.PATH ?? "").split(":").concat(join(homedir(), ".bun", "bin"))) {
+    const p = join(dir, "typescript-language-server");
+    if (dir && existsSync(p)) return p;
+  }
+  return null;
+}
+
+/** The server for files in `dir`: the nearest node_modules/typescript above it. */
+export function specFor(dir: string): Spec | null {
+  const cached = specCache.get(dir);
+  if (cached !== undefined) return cached;
+  let spec: Spec | null = null;
+  const pkg = join(dir, "node_modules", "typescript", "package.json");
+  if (existsSync(pkg)) {
+    const tsDir = realpathSync(dirname(pkg));
+    const version: string = JSON.parse(readFileSync(pkg, "utf8")).version ?? "0";
+    if (Number(version.split(".")[0]) >= 7) {
+      const tsc = join(tsDir, "bin", "tsc");
+      spec = { key: `tsc ${tsc}`, kind: "tsc", version, cmd: [tsc, "--lsp", "--stdio"], tsDir };
+    } else {
+      const tsls = findTsls();
+      if (tsls) spec = { key: `tsls ${tsDir}`, kind: "tsls", version, cmd: [tsls, "--stdio"], tsDir };
+    }
+  } else if (dirname(dir) !== dir) {
+    spec = specFor(dirname(dir));
+  }
+  specCache.set(dir, spec);
+  return spec;
+}
+
+const uriDir = (uri: string) => {
+  try {
+    return dirname(fileURLToPath(uri));
+  } catch {
+    return null;
+  }
+};
+
+// ---- sessions ----------------------------------------------------------------
+
+type ClientData = { client?: Client };
+
+class Client {
+  static seq = 0;
+  readonly n = ++Client.seq;
+  readonly decoder = new Decoder();
+  readonly out: SocketWriter;
+  cwd?: string;
+  root?: string;
+  initParams?: any;
+  home?: Server; // the server for the session's own folder: answers initialize and workspace requests
+  readonly servers = new Set<Server>();
+  readonly docServer = new Map<string, Server>();
+  closed = false;
+  constructor(readonly sock: Socket<ClientData>) {
+    this.out = new SocketWriter(sock);
+  }
+  send(msg: Message) {
+    if (this.closed) return;
+    if (msg.method === "textDocument/publishDiagnostics")
+      debug("daemon", "session", this.n, "pushed by server", (msg.params as any).uri, (msg.params as any).diagnostics?.length);
+    this.out.write(encode(msg));
+  }
+}
+
+type Pending = { client: Client; id: number | string } | { resolve: (m: Message) => void };
+
+class Server {
+  readonly proc: ReturnType<typeof Bun.spawn>;
+  readonly decoder = new Decoder();
+  readonly clients = new Set<Client>();
+  readonly pending = new Map<number, Pending>();
+  readonly docs = new Map<string, { uri: string; version: number; owners: Set<Client> }>();
+  readonly roots = new Set<string>();
+  private queue: unknown[] | null = []; // held until the server has answered initialize
+  nextId = 1;
+  init: Promise<Message>;
+  idleTimer?: Timer;
+  dead = false;
+
+  constructor(
+    readonly spec: Spec,
+    cwd: string,
+    initParams: any,
+  ) {
+    this.proc = Bun.spawn(spec.cmd, {
+      cwd,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "ignore",
+      onExit: (_p, code) => this.onExit(code),
+    });
+    log("server start", spec.key, spec.version, "pid", this.proc.pid);
+    this.pump();
+    const params = structuredClone(initParams ?? {});
+    params.processId = null; // the server must outlive the session that started it
+    params.capabilities ??= {};
+    params.capabilities.textDocument ??= {};
+    params.capabilities.textDocument.diagnostic ??= { dynamicRegistration: false };
+    params.capabilities.workspace ??= {};
+    params.capabilities.workspace.configuration = true;
+    params.capabilities.workspace.workspaceFolders = true;
+    if (spec.kind === "tsls") {
+      params.initializationOptions ??= {};
+      params.initializationOptions.tsserver = { ...params.initializationOptions.tsserver, path: join(spec.tsDir, "lib", "tsserver.js") };
+    }
+    for (const f of params.workspaceFolders ?? []) this.roots.add(f.uri);
+    if (!params.workspaceFolders?.length && params.rootUri) this.roots.add(params.rootUri);
+    const id = this.nextId++;
+    this.init = new Promise<Message>((resolve) => {
+      this.pending.set(id, { resolve });
+      this.raw({ jsonrpc: "2.0", id, method: "initialize", params });
+    }).then((m) => {
+      this.raw({ jsonrpc: "2.0", method: "initialized", params: {} });
+      const q = this.queue ?? [];
+      this.queue = null;
+      for (const msg of q) this.raw(msg);
+      return m;
+    });
+  }
+
+  private async pump() {
+    const stdout = this.proc.stdout as ReadableStream<Uint8Array>;
+    for await (const chunk of stdout) for (const m of this.decoder.push(chunk)) this.onMessage(m);
+  }
+
+  private raw(msg: unknown) {
+    if (!this.dead) (this.proc.stdin as import("bun").FileSink).write(encode(msg));
+  }
+  write(msg: unknown) {
+    if (this.queue) this.queue.push(msg);
+    else this.raw(msg);
+  }
+  notify(method: string, params: unknown) {
+    this.write({ jsonrpc: "2.0", method, params });
+  }
+  forwardRequest(client: Client, m: Message) {
+    const id = this.nextId++;
+    this.pending.set(id, { client, id: m.id! });
+    this.write({ ...m, id });
+  }
+  cancel(client: Client, clientId: number | string) {
+    for (const [sid, p] of this.pending)
+      if ("client" in p && p.client === client && p.id === clientId) this.notify("$/cancelRequest", { id: sid });
+  }
+
+  private onMessage(m: Message) {
+    if (m.method && m.id != null) return this.answerServerRequest(m);
+    if (m.method) {
+      if (m.method === "textDocument/publishDiagnostics") {
+        // Pre-7 servers push on their own; TypeScript 7 only for tsconfig files.
+        const doc = this.docs.get(uriKey((m.params as any).uri));
+        for (const c of doc?.owners ?? []) c.send({ ...m, params: { ...(m.params as any), uri: doc!.uri } });
+      }
+      return; // logs, progress, telemetry: nobody is listening
+    }
+    const p = this.pending.get(m.id as number);
+    if (!p) return;
+    this.pending.delete(m.id as number);
+    if ("resolve" in p) p.resolve(m);
+    else p.client.send({ ...m, id: p.id });
+  }
+
+  private answerServerRequest(m: Message) {
+    let result: unknown = null;
+    if (m.method === "workspace/configuration") result = ((m.params as any)?.items ?? []).map(() => ({}));
+    else if (m.method === "workspace/workspaceFolders")
+      result = [...this.roots].map((uri) => ({ uri, name: uri.split("/").pop() }));
+    this.raw({ jsonrpc: "2.0", id: m.id, result });
+  }
+
+  addRoot(uri: string | undefined) {
+    if (!uri || this.roots.has(uri)) return;
+    this.roots.add(uri);
+    this.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [{ uri, name: uri.split("/").pop() }], removed: [] },
+    });
+  }
+
+  attach(c: Client) {
+    clearTimeout(this.idleTimer);
+    if (this.clients.has(c)) return;
+    this.clients.add(c);
+    c.servers.add(this);
+    this.addRoot(c.root);
+  }
+
+  detach(c: Client) {
+    this.clients.delete(c);
+    for (const [key, doc] of this.docs) if (doc.owners.has(c)) this.release(c, key);
+    for (const [sid, p] of this.pending) if ("client" in p && p.client === c) this.pending.delete(sid);
+    if (this.clients.size === 0) this.idleTimer = setTimeout(() => this.stop("idle"), IDLE_MS);
+  }
+
+  open(c: Client, td: { uri: string; languageId: string; text: string }) {
+    const key = uriKey(td.uri);
+    const doc = this.docs.get(key);
+    if (!doc) {
+      this.docs.set(key, { uri: td.uri, version: 1, owners: new Set([c]) });
+      this.notify("textDocument/didOpen", { textDocument: { ...td, version: 1 } });
+    } else {
+      doc.owners.add(c);
+      doc.version++;
+      // Already open for another session: bring the server up to this session's text.
+      this.notify("textDocument/didChange", {
+        textDocument: { uri: doc.uri, version: doc.version },
+        contentChanges: [{ text: td.text }],
+      });
+    }
+  }
+
+  change(params: any) {
+    const doc = this.docs.get(uriKey(params.textDocument.uri));
+    if (!doc) return;
+    doc.version++;
+    this.notify("textDocument/didChange", { ...params, textDocument: { uri: doc.uri, version: doc.version } });
+  }
+
+  release(c: Client, key: string) {
+    const doc = this.docs.get(key);
+    if (!doc) return;
+    doc.owners.delete(c);
+    if (doc.owners.size === 0) {
+      this.docs.delete(key);
+      this.notify("textDocument/didClose", { textDocument: { uri: doc.uri } });
+    }
+  }
+
+  stop(why: string) {
+    log("server stop", this.spec.key, why);
+    this.proc.kill();
+  }
+
+  private onExit(code: number | null) {
+    this.dead = true;
+    servers.delete(this.spec.key);
+    log("server exit", this.spec.key, "code", code);
+    for (const [, p] of this.pending) {
+      if ("resolve" in p) p.resolve({ jsonrpc: "2.0", error: { code: -32603, message: "server exited" } });
+    }
+    // Close the sessions: Claude Code restarts its shim, which starts a fresh server.
+    for (const c of this.clients) c.sock.end();
+    checkDaemonIdle();
+  }
+}
+
+const servers = new Map<string, Server>();
+const clients = new Set<Client>();
+let daemonIdle: Timer | undefined;
+
+/** The server for `spec`, started on first use, with this session attached. */
+function serverFor(c: Client, spec: Spec): Server {
+  let s = servers.get(spec.key);
+  if (!s) {
+    s = new Server(spec, c.cwd ?? process.cwd(), c.initParams);
+    servers.set(spec.key, s);
+  }
+  s.attach(c);
+  return s;
+}
+
+/** The server a document belongs to, for this session. */
+function routeDoc(c: Client, uri: string): Server | undefined {
+  const known = c.docServer.get(uriKey(uri));
+  if (known && !known.dead) return known;
+  const dir = uriDir(uri);
+  const spec = dir ? specFor(dir) : null;
+  return spec ? serverFor(c, spec) : c.home;
+}
+
+function checkDaemonIdle() {
+  clearTimeout(daemonIdle);
+  if (clients.size > 0) return;
+  daemonIdle = setTimeout(() => {
+    log("daemon idle exit");
+    for (const s of servers.values()) s.stop("daemon exit");
+    cleanup();
+    process.exit(0);
+  }, IDLE_MS);
+}
+
+function rssOf(pid: number): number {
+  const out = Bun.spawnSync(["ps", "-o", "rss=", "-p", String(pid)]).stdout.toString().trim();
+  return Math.round(Number(out || 0) / 1024);
+}
+
+function status() {
+  return {
+    daemon: { pid: process.pid, rssMB: rssOf(process.pid) },
+    servers: [...servers.values()].map((s) => ({
+      kind: s.spec.kind,
+      typescript: s.spec.version,
+      typescriptDir: s.spec.tsDir,
+      pid: s.proc.pid,
+      rssMB: rssOf(s.proc.pid),
+      sessions: [...s.clients].map((c) => c.root ?? c.cwd),
+      openDocs: [...s.docs.values()].map((d) => d.uri),
+    })),
+  };
+}
+
+async function onClientMessage(c: Client, m: Message) {
+  const td = (m.params as any)?.textDocument;
+  debug("daemon", "session", c.n, m.method ?? "response", "id", m.id, td?.uri ?? "");
+  if (m.method === "hub/hello") {
+    c.cwd = (m.params as any).cwd;
+    return;
+  }
+  if (m.method === "hub/status") return c.send({ jsonrpc: "2.0", id: m.id, result: status() });
+
+  if (m.method === "initialize") {
+    const params = (m.params ?? {}) as any;
+    c.initParams = params;
+    c.root = params.workspaceFolders?.[0]?.uri ?? params.rootUri ?? (c.cwd ? `file://${c.cwd}` : undefined);
+    const spec = specFor(c.cwd ?? process.cwd());
+    if (!spec)
+      return c.send({ jsonrpc: "2.0", id: m.id, error: { code: -32603, message: "shared-typescript-lsp: no TypeScript found" } });
+    c.home = serverFor(c, spec);
+    log("session", c.n, "attached", c.root, "home", spec.kind, spec.version);
+    const init = await c.home.init;
+    return c.send({ ...init, id: m.id });
+  }
+
+  if (m.method === "shutdown") return c.send({ jsonrpc: "2.0", id: m.id, result: null });
+  if (m.method === "exit") return c.sock.end();
+  if (m.method === "initialized") return;
+  if (!c.home) {
+    if (m.id != null && m.method)
+      c.send({ jsonrpc: "2.0", id: m.id, error: { code: -32002, message: "server not initialized" } });
+    return;
+  }
+  if (m.method === "$/cancelRequest") {
+    for (const s of c.servers) s.cancel(c, (m.params as any).id);
+    return;
+  }
+  if (!m.method) return; // responses to server requests: the daemon already answered
+
+  if (td?.uri) {
+    const s = routeDoc(c, td.uri);
+    if (!s) return;
+    const key = uriKey(td.uri);
+    switch (m.method) {
+      case "textDocument/didOpen":
+        c.docServer.set(key, s);
+        return s.open(c, td);
+      case "textDocument/didChange":
+        return s.change(m.params);
+      case "textDocument/didClose":
+        c.docServer.delete(key);
+        return s.release(c, key);
+    }
+    if (m.id != null) return s.forwardRequest(c, m);
+    return s.notify(m.method, m.params); // didSave
+  }
+  if (m.id != null) return c.home.forwardRequest(c, m); // workspace/symbol and friends
+  for (const s of c.servers) s.notify(m.method, m.params); // watched files, config changes
+}
+
+function cleanup() {
+  try {
+    unlinkSync(SOCKET);
+  } catch {}
+}
+
+async function alreadyRunning(): Promise<boolean> {
+  if (!existsSync(SOCKET)) return false;
+  try {
+    const s = await Bun.connect({ unix: SOCKET, socket: { data() {} } });
+    s.end();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function main() {
+  mkdirSync(dirname(SOCKET), { recursive: true });
+  if (await alreadyRunning()) process.exit(0);
+  cleanup(); // stale socket from a daemon that died
+  Bun.listen<ClientData>({
+    unix: SOCKET,
+    socket: {
+      open(sock) {
+        const c = new Client(sock);
+        sock.data = { client: c };
+        clients.add(c);
+        clearTimeout(daemonIdle);
+      },
+      data(sock, chunk) {
+        const c = sock.data.client!;
+        for (const m of c.decoder.push(chunk)) onClientMessage(c, m).catch((e) => log("error", String(e)));
+      },
+      drain(sock) {
+        sock.data.client?.out.drain();
+      },
+      close(sock) {
+        const c = sock.data.client!;
+        if (c.closed) return;
+        c.closed = true;
+        clients.delete(c);
+        for (const s of c.servers) s.detach(c);
+        log("session", c.n, "closed", c.root);
+        checkDaemonIdle();
+      },
+      error(_sock, err) {
+        log("socket error", String(err));
+      },
+    },
+  });
+  log("daemon start pid", process.pid, "idle ms", IDLE_MS);
+  for (const sig of ["SIGTERM", "SIGINT"] as const)
+    process.on(sig, () => {
+      for (const s of servers.values()) s.stop(sig);
+      cleanup();
+      process.exit(0);
+    });
+  checkDaemonIdle();
+}
+
+if (import.meta.main) main();

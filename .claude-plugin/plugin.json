@@ -1,0 +1,10 @@
+{
+  "name": "shared-typescript-lsp",
+  "version": "0.4.0",
+  "description": "One shared TypeScript language server for all your Claude Code sessions and worktrees, with TypeScript 7 type errors pushed to the agent after each edit.",
+  "author": { "name": "Stef Lewandowski", "url": "https://github.com/stefl" },
+  "homepage": "https://github.com/stefl/shared-typescript-lsp",
+  "repository": "https://github.com/stefl/shared-typescript-lsp",
+  "license": "MIT",
+  "keywords": ["typescript", "lsp", "language-server", "worktrees", "tsgo", "typescript-7"]
+}

@@ -1,0 +1,17 @@
+{
+  "typescript": {
+    "command": "bash",
+    "args": ["${CLAUDE_PLUGIN_ROOT}/bin/shared-typescript-lsp"],
+    "diagnostics": true,
+    "extensionToLanguage": {
+      ".ts": "typescript",
+      ".mts": "typescript",
+      ".cts": "typescript",
+      ".tsx": "typescriptreact",
+      ".js": "javascript",
+      ".mjs": "javascript",
+      ".cjs": "javascript",
+      ".jsx": "javascriptreact"
+    }
+  }
+}

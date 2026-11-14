@@ -1,0 +1,11 @@
+{
+  "name": "shared-typescript-lsp",
+  "version": "0.4.0",
+  "description": "One shared TypeScript language server for all your Claude Code sessions and worktrees.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "bin": { "shared-typescript-lsp": "bin/shared-typescript-lsp" },
+  "scripts": { "test": "bun test test/framing.test.ts" },
+  "devDependencies": { "@types/bun": "latest" }
+}

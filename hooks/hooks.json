@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/shared-typescript-lsp\" warm; exit 0",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,70 @@
+#!/bin/bash
+# shared-typescript-lsp: the TypeScript language server command for Claude Code.
+#
+# Runs the shared-typescript-lsp shim, which connects to a shared daemon. The daemon routes
+# each file to the server for the nearest node_modules/typescript above it:
+# `tsc --lsp` for TypeScript 7 or later (shared between sessions, with type
+# errors pushed after edits), typescript-language-server for older TypeScript.
+# With no TypeScript above the folder, runs typescript-language-server directly.
+#
+#   shared-typescript-lsp              run as a language server (stdio)
+#   shared-typescript-lsp status       show the shared servers, their sessions and memory
+#   shared-typescript-lsp warm         start the server for this folder now (SessionStart hook)
+#   shared-typescript-lsp stop         stop the daemon and its servers
+#
+# Set SHARED_TS_LSP_OFF=1 to skip the shared daemon: each session runs its own server, chosen
+# from the TypeScript above its starting folder.
+# Log lines go to stderr only: stdout is the LSP protocol channel.
+
+HUB="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+BUN="${BUN:-$HOME/.bun/bin/bun}"
+[ -x "$BUN" ] || BUN="$(command -v bun)"
+if [ -z "$BUN" ]; then
+  echo "shared-typescript-lsp: Bun not found; install it from https://bun.sh" >&2
+  [ "$1" = warm ] && exit 0
+  exit 1
+fi
+
+case "$1" in
+  status) exec "$BUN" "$HUB/src/shim.ts" status ;;
+  warm)
+    # SessionStart hook: start the shared server now, in the background, silently.
+    [ -n "$SHARED_TS_LSP_OFF" ] && exit 0
+    (cd "${CLAUDE_PROJECT_DIR:-$PWD}" && nohup "$BUN" "$HUB/src/shim.ts" warm >/dev/null 2>&1 &)
+    exit 0 ;;
+  stop)
+    pid=$("$BUN" "$HUB/src/shim.ts" status 2>/dev/null | sed -n 's/.*"pid": \([0-9]*\).*/\1/p' | head -1)
+    [ -n "$pid" ] && kill "$pid" && echo "shared-typescript-lsp: stopped daemon $pid" || echo "shared-typescript-lsp: daemon not running"
+    exit 0 ;;
+esac
+
+dir="$PWD"
+while [ "$dir" != "/" ] && [ ! -f "$dir/node_modules/typescript/package.json" ]; do
+  dir=$(dirname "$dir")
+done
+
+if [ -f "$dir/node_modules/typescript/package.json" ]; then
+  version=$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/node_modules/typescript/package.json" | head -1)
+  major=${version%%.*}
+  if [ -z "$SHARED_TS_LSP_OFF" ]; then
+    # The daemon picks the server per file: a repo can mix TypeScript versions.
+    echo "shared-typescript-lsp: TypeScript $version in $dir, using the shared server" >&2
+    exec "$BUN" "$HUB/src/shim.ts"
+  fi
+  if [ "${major:-0}" -ge 7 ] 2>/dev/null && [ -x "$dir/node_modules/.bin/tsc" ]; then
+    echo "shared-typescript-lsp: off, TypeScript $version in $dir, using its own tsc --lsp" >&2
+    exec "$dir/node_modules/.bin/tsc" --lsp --stdio
+  fi
+  echo "shared-typescript-lsp: off, TypeScript $version in $dir, using typescript-language-server" >&2
+else
+  echo "shared-typescript-lsp: no node_modules/typescript above $PWD, using typescript-language-server" >&2
+fi
+
+for candidate in "$(command -v typescript-language-server)" "$HOME/.bun/bin/typescript-language-server"; do
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    exec "$candidate" --stdio
+  fi
+done
+
+echo "shared-typescript-lsp: typescript-language-server not found" >&2
+exit 1

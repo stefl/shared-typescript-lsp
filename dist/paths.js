@@ -30,6 +30,14 @@ export const LOG = join(HUB_DIR, "daemon.log");
 /** Close a server, and then the daemon, after this long with no sessions. */
 export const IDLE_MS = Number(process.env.SHARED_TS_LSP_IDLE_MS ?? 10 * 60 * 1000);
 
+/** Restart a server whose full memory (swapped and compressed included) passes
+ * this many MB. 0 turns the cap off. A big monorepo's server can start at 4 to
+ * 6 GB, so the default leaves room for several worktrees above that. */
+export const MAX_MB = Number(process.env.SHARED_TS_LSP_MAX_MB ?? 12 * 1024);
+
+/** How often the daemon reads each server's memory. */
+export const CHECK_MS = Number(process.env.SHARED_TS_LSP_CHECK_MS ?? 60 * 1000);
+
 /** Case-folded key for a file URI: the server lower-cases paths on macOS. */
 export const uriKey = (uri        ) => uri.toLowerCase();
 

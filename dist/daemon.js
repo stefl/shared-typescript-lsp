@@ -14,14 +14,15 @@
 // counts opens per document so one session closing a file doesn't close it for
 // another, and answers the servers' own requests (configuration, progress).
 
-import { execFileSync, spawn,                   } from "node:child_process";
+import { execFile, execFileSync, spawn,                   } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
 import { createConnection, createServer,             } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Decoder, encode,              } from "./framing.js";
-import { IDLE_MS, LOG, SOCKET, VERSION, debug, isMain, uriKey } from "./paths.js";
+import { CHECK_MS, IDLE_MS, LOG, MAX_MB, SOCKET, VERSION, debug, isMain, uriKey } from "./paths.js";
 
                                            
 
@@ -229,8 +230,40 @@ class Server {
     });
   }
 
+  /**
+   * Take a worktree out of the server once no session uses it. Without this
+   * every worktree that ever attached stayed loaded, and one busy repo's server
+   * reached 85 GB after 81 worktrees in 28 hours.
+   */
+  removeRoot(uri                    ) {
+    if (!uri || !this.roots.has(uri)) return;
+    for (const other of this.clients) if (other.root === uri) return;
+    this.roots.delete(uri);
+    log("server", this.spec.key, "drop folder", uri);
+    this.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [], removed: [{ uri, name: uri.split("/").pop() }] },
+    });
+  }
+
+  /** Drop a folder after IDLE_MS with no session on it, so the warm-start hook's
+   * short session doesn't throw away the project it just loaded. */
+           rootTimers = new Map               ();
+  scheduleRemoveRoot(uri                    ) {
+    if (!uri || this.rootTimers.has(uri)) return;
+    const t = setTimeout(() => {
+      this.rootTimers.delete(uri);
+      this.removeRoot(uri);
+    }, IDLE_MS);
+    t.unref();
+    this.rootTimers.set(uri, t);
+  }
+
   attach(c        ) {
     clearTimeout(this.idleTimer);
+    if (c.root) {
+      clearTimeout(this.rootTimers.get(c.root));
+      this.rootTimers.delete(c.root);
+    }
     if (this.clients.has(c)) return;
     this.clients.add(c);
     c.servers.add(this);
@@ -241,6 +274,7 @@ class Server {
     this.clients.delete(c);
     for (const [key, doc] of this.docs) if (doc.owners.has(c)) this.release(c, key);
     for (const [sid, p] of this.pending) if ("client" in p && p.client === c) this.pending.delete(sid);
+    this.scheduleRemoveRoot(c.root);
     if (this.clients.size === 0) this.idleTimer = setTimeout(() => this.stop("idle"), IDLE_MS);
   }
 
@@ -281,6 +315,10 @@ class Server {
   stop(why        ) {
     log("server stop", this.spec.key, why);
     this.proc.kill();
+    // A server deep in swap can take a while to act on SIGTERM.
+    setTimeout(() => {
+      if (!this.dead) this.proc.kill("SIGKILL");
+    }, 10_000).unref();
   }
 
           onExit(code               ) {
@@ -341,19 +379,64 @@ function rssOf(pid        )         {
   }
 }
 
-function status() {
+const run = (cmd        , args          ) =>
+  new Promise        ((done) => execFile(cmd, args, { encoding: "utf8", timeout: 5000 }, (_e, out) => done(out ?? "")));
+
+const UNIT_MB                         = { B: 1 / 1048576, KB: 1 / 1024, MB: 1, GB: 1024 };
+
+/**
+ * A process's full memory in MB: what Activity Monitor shows, swapped and
+ * compressed pages included. `ps` reports only what is in RAM, which showed
+ * 2.4 GB for a server whose real size was 85 GB. Falls back to RSS.
+ */
+export async function memoryMB(pid        )                  {
+  if (process.platform === "darwin") {
+    const m = /phys_footprint:\s*([\d.]+)\s*(B|KB|MB|GB)/.exec(await run("/usr/bin/footprint", ["-p", String(pid)]));
+    if (m) return Math.round(Number(m[1]) * UNIT_MB[m[2]]);
+  } else if (process.platform === "linux") {
+    try {
+      const s = await readFile(`/proc/${pid}/status`, "utf8");
+      const kb = (k        ) => Number(new RegExp(`${k}:\\s*(\\d+)`).exec(s)?.[1] ?? 0);
+      return Math.round((kb("VmRSS") + kb("VmSwap")) / 1024);
+    } catch {}
+  }
+  return rssOf(pid);
+}
+
+let checking = false;
+
+/** Restart any server over the memory cap. Its sessions reconnect to a fresh one. */
+async function checkMemory() {
+  if (checking || !(MAX_MB > 0)) return;
+  checking = true;
+  try {
+    for (const s of [...servers.values()]) {
+      if (s.dead || !s.proc.pid) continue;
+      const mb = await memoryMB(s.proc.pid);
+      if (mb > MAX_MB) s.stop(`memory ${mb} MB over cap ${MAX_MB} MB, ${s.clients.size} sessions, ${s.roots.size} folders`);
+    }
+  } finally {
+    checking = false;
+  }
+}
+
+async function status() {
   return {
-    daemon: { pid: process.pid, version: VERSION, runtime: process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.versions.node}`, rssMB: rssOf(process.pid) },
-    servers: [...servers.values()].map((s) => ({
-      kind: s.spec.kind,
-      typescript: s.spec.version,
-      repo: s.spec.repo,
-      typescriptDir: s.spec.tsDir,
-      pid: s.proc.pid,
-      rssMB: s.proc.pid ? rssOf(s.proc.pid) : 0,
-      sessions: [...s.clients].map((c) => c.root ?? c.cwd),
-      openDocs: [...s.docs.values()].map((d) => d.uri),
-    })),
+    daemon: { pid: process.pid, version: VERSION, runtime: process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.versions.node}`, rssMB: rssOf(process.pid), memoryCapMB: MAX_MB },
+    servers: await Promise.all(
+      [...servers.values()].map(async (s) => ({
+        kind: s.spec.kind,
+        typescript: s.spec.version,
+        repo: s.spec.repo,
+        typescriptDir: s.spec.tsDir,
+        pid: s.proc.pid,
+        rssMB: s.proc.pid ? rssOf(s.proc.pid) : 0,
+        memoryMB: s.proc.pid ? await memoryMB(s.proc.pid) : 0,
+        folders: [...s.roots],
+        sessions: [...s.clients].map((c) => c.root ?? c.cwd),
+        openDocs: [...s.docs.values()].map((d) => d.uri),
+      })),
+    ),
   };
 }
 
@@ -364,7 +447,7 @@ async function onClientMessage(c        , m         ) {
     c.cwd = (m.params       ).cwd;
     return;
   }
-  if (m.method === "hub/status") return c.send({ jsonrpc: "2.0", id: m.id, result: status() });
+  if (m.method === "hub/status") return c.send({ jsonrpc: "2.0", id: m.id, result: await status() });
 
   if (m.method === "initialize") {
     const params = (m.params ?? {})       ;
@@ -458,7 +541,8 @@ export async function main() {
     process.exit(1);
   });
   server.listen(SOCKET);
-  log("daemon start pid", process.pid, "version", VERSION, "idle ms", IDLE_MS);
+  log("daemon start pid", process.pid, "version", VERSION, "idle ms", IDLE_MS, "memory cap MB", MAX_MB);
+  if (MAX_MB > 0) setInterval(() => checkMemory().catch((e) => log("memory check error", String(e))), CHECK_MS).unref();
   for (const sig of ["SIGTERM", "SIGINT"]         )
     process.on(sig, () => {
       for (const s of servers.values()) s.stop(sig);
